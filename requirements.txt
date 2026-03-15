@@ -1,0 +1,8 @@
+rapidfuzz==3.9.4
+pydantic==2.10.4
+opencv-python
+Pillow
+pytesseract
+paddleocr
+easyocr
+numpy
