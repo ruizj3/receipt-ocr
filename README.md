@@ -5,7 +5,7 @@ Code generated with input from Claude Sonnet 4.5 2026-01-12
 
 source ~/.bashrc
 source receipt_history_env/bin/activate
-From within receipt_price_history folder:python receipt_scanner.py
+python receipt_scanner.py
 
 Summary - OCR Library Comparison & Current Setup
 PaddleOCR is generally considered superior to Tesseract for receipt OCR because:

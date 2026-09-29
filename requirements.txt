@@ -4,5 +4,7 @@ opencv-python
 Pillow
 pytesseract
 paddleocr
+paddlepaddle
 easyocr
 numpy
+scikit-learn

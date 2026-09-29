@@ -1,10 +1,14 @@
 import os
 import re
+from importlib.util import find_spec
+from inspect import signature
 from datetime import datetime
 from typing import List, Optional, Dict, Tuple
 
 from pydantic import BaseModel
 from rapidfuzz import process, fuzz
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 import cv2
 import numpy as np
 
@@ -59,6 +63,61 @@ def preprocess_image_advanced(image_path: str) -> np.ndarray:
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
     
     return cleaned
+
+
+def rectify_receipt(image: np.ndarray) -> np.ndarray:
+    """Perspective-correct a clearly detected receipt quadrilateral; otherwise return the input."""
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 40, 120)
+    edges = cv2.morphologyEx(
+        edges, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8), iterations=2
+    )
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    image_area = float(height * width)
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:30]:
+        area = cv2.contourArea(contour)
+        if area < image_area * 0.15 or area > image_area * 0.98:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        polygon = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if len(polygon) == 4 and cv2.isContourConvex(polygon):
+            candidates.append((area, polygon.reshape(4, 2).astype(np.float32)))
+
+    if not candidates:
+        return image
+
+    points = candidates[0][1]
+    sums = points.sum(axis=1)
+    differences = np.diff(points, axis=1).ravel()
+    ordered = np.array(
+        [
+            points[np.argmin(sums)],
+            points[np.argmin(differences)],
+            points[np.argmax(sums)],
+            points[np.argmax(differences)],
+        ],
+        dtype=np.float32,
+    )
+    top_left, top_right, bottom_right, bottom_left = ordered
+    output_width = int(
+        max(np.linalg.norm(bottom_right - bottom_left), np.linalg.norm(top_right - top_left))
+    )
+    output_height = int(
+        max(np.linalg.norm(top_right - bottom_right), np.linalg.norm(top_left - bottom_left))
+    )
+    if output_width < 100 or output_height < 100:
+        return image
+
+    destination = np.array(
+        [[0, 0], [output_width - 1, 0], [output_width - 1, output_height - 1], [0, output_height - 1]],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(ordered, destination)
+    return cv2.warpPerspective(image, transform, (output_width, output_height))
 
 
 def detect_and_correct_rotation(image: np.ndarray) -> np.ndarray:
@@ -129,23 +188,69 @@ def try_paddleocr(image_path: str) -> str:
     Use PaddleOCR - often more accurate than Tesseract for receipts.
     Fast and robust for various image qualities.
     """
+    if find_spec("paddle") is None:
+        print("[INFO] PaddleOCR runtime is not installed (missing 'paddle'); skipping.")
+        return ""
+
     try:
         from paddleocr import PaddleOCR
-        
-        # Initialize PaddleOCR (lang='en' for English)
-        # use_angle_cls=True for rotation detection
+
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"[WARN] PaddleOCR could not load image: {image_path}")
+            return ""
+        height, width = image.shape[:2]
+        max_side = 2400
+        scale = min(1.0, max_side / max(height, width))
+        if scale < 1.0:
+            image = cv2.resize(
+                image,
+                (int(width * scale), int(height * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+            print(f"[OCR] Resized PaddleOCR input to {image.shape[1]}x{image.shape[0]}")
+
+        parameters = signature(PaddleOCR).parameters
+        orientation_option = (
+            "use_textline_orientation"
+            if "use_textline_orientation" in parameters
+            else "use_angle_cls"
+        )
         print("[OCR] Initializing PaddleOCR (downloading models on first run)...")
-        ocr = PaddleOCR(use_angle_cls=True, lang='en')
-        
+        ocr = PaddleOCR(**{orientation_option: True, "lang": "en"})
+
         print("[OCR] Running PaddleOCR on image...")
-        result = ocr.ocr(image_path, cls=True)
-        
-        # Extract text from result
-        if result and result[0]:
-            lines = [line[1][0] for line in result[0]]
-            text = '\n'.join(lines)
-            return text
-        return ""
+        if hasattr(ocr, "predict"):
+            predict_parameters = signature(ocr.predict).parameters
+            input_parameter = "input" if "input" in predict_parameters else "img"
+            result = ocr.predict(**{input_parameter: image})
+        else:
+            ocr_parameters = signature(ocr.ocr).parameters
+            result = ocr.ocr(image, cls=True) if "cls" in ocr_parameters else ocr.ocr(image)
+
+        lines = []
+        for page in result or []:
+            if isinstance(page, dict):
+                page_data = page.get("res", page)
+            else:
+                page_data = getattr(page, "json", page)
+                if callable(page_data):
+                    page_data = page_data()
+                if isinstance(page_data, dict):
+                    page_data = page_data.get("res", page_data)
+
+            if isinstance(page_data, dict) and "rec_texts" in page_data:
+                lines.extend(str(line) for line in page_data["rec_texts"] if line)
+            elif isinstance(page_data, (list, tuple)):
+                lines.extend(
+                    str(line[1][0])
+                    for line in page_data
+                    if isinstance(line, (list, tuple))
+                    and len(line) > 1
+                    and isinstance(line[1], (list, tuple))
+                    and line[1]
+                )
+        return '\n'.join(lines)
     except ImportError as e:
         print(f"[INFO] PaddleOCR not available: {e}")
         return ""
@@ -162,9 +267,25 @@ def try_easyocr(image_path: str) -> str:
     """
     try:
         import easyocr
+
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"[WARN] EasyOCR could not load image: {image_path}")
+            return ""
+
         print("[OCR] Loading EasyOCR (this may take a while on first run)...")
         reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-        result = reader.readtext(image_path, detail=0, paragraph=True)
+        horizontal_batches, _ = reader.detect(image)
+        height, width = image.shape[:2]
+        boxes = horizontal_batches[0] if horizontal_batches else []
+        valid_boxes = _clip_easyocr_horizontal_boxes(boxes, width, height)
+        if not valid_boxes:
+            valid_boxes = [[0, width, 0, height]]
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        result = reader.recognize(
+            gray, valid_boxes, [], detail=0, paragraph=True, reformat=False
+        )
         return '\n'.join(result)
     except ImportError:
         print("[INFO] EasyOCR not available. Install with: pip install easyocr")
@@ -174,139 +295,327 @@ def try_easyocr(image_path: str) -> str:
         return ""
 
 
+def _clip_easyocr_horizontal_boxes(
+    boxes: List[List[int]], width: int, height: int
+) -> List[List[int]]:
+    valid_boxes = []
+    for box in boxes:
+        if len(box) != 4:
+            continue
+        x_min = max(0, min(width, int(box[0])))
+        x_max = max(0, min(width, int(box[1])))
+        y_min = max(0, min(height, int(box[2])))
+        y_max = max(0, min(height, int(box[3])))
+        if x_max > x_min and y_max > y_min:
+            valid_boxes.append([x_min, x_max, y_min, y_max])
+    return valid_boxes
+
+
 def score_ocr_quality(text: str) -> int:
-    """
-    Score OCR text quality based on:
-    - Number of readable words
-    - Presence of common receipt keywords
-    - Ratio of letters to garbage characters
-    """
+    """Return a receipt-aware text quality score from 0 to 100."""
     if not text:
         return 0
-    
-    score = 0
-    
-    # Count words (sequences of 3+ letters)
-    words = re.findall(r'[A-Za-z]{3,}', text)
-    score += len(words) * 10
-    
-    # Bonus for common receipt words
-    receipt_keywords = ['total', 'subtotal', 'tax', 'item', 'price', 'sale', 
-                       'card', 'visa', 'payment', 'balance', 'store', 'receipt']
-    for keyword in receipt_keywords:
-        if keyword.lower() in text.lower():
-            score += 50
-    
-    # Bonus for dollar amounts
-    prices = re.findall(r'\$?\d+\.\d{2}', text)
-    score += len(prices) * 20
-    
-    # Penalty for too many non-ascii or special chars
-    ascii_ratio = sum(c.isalnum() or c.isspace() for c in text) / max(len(text), 1)
-    score += int(ascii_ratio * 100)
-    
-    return score
 
-def ocr_receipt_to_text(path: str) -> str:
-    """
-    Extract text from receipt using multiple strategies:
-    1. Try all 4 rotations with Tesseract and pick the best based on text quality (fast, works well)
-    2. Advanced preprocessing if needed
-    3. Try PaddleOCR if available (slower first run, but more accurate)
-    4. Fallback to EasyOCR if all else fails
-    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    prices = re.findall(r"\$?\d{1,5}[.,]\d{2}\b", text)
+    item_lines = sum(
+        bool(re.search(r"[A-Za-z]{2,}", line) and re.search(r"\d+[.,]\d{2}", line))
+        for line in lines
+    )
+    readable_ratio = sum(char.isalnum() or char.isspace() for char in text) / max(len(text), 1)
+
+    score = (
+        min(20, len(words) * 1.5)
+        + min(20, len(prices) * 4)
+        + min(30, item_lines * 8)
+        + min(15, readable_ratio * 15)
+        + min(15, len(lines) * 1.5)
+    )
+    return int(round(score))
+
+
+def _group_tesseract_words(data: Dict[str, List]) -> List[List[Dict[str, object]]]:
+    grouped: Dict[Tuple[int, int, int], List[Dict[str, object]]] = {}
+    for index, raw_text in enumerate(data.get("text", [])):
+        word = str(raw_text).strip()
+        if not word:
+            continue
+        key = (
+            int(data["block_num"][index]),
+            int(data["par_num"][index]),
+            int(data["line_num"][index]),
+        )
+        grouped.setdefault(key, []).append(
+            {
+                "text": word,
+                "left": int(data["left"][index]),
+                "top": int(data["top"][index]),
+                "width": int(data["width"][index]),
+                "height": int(data["height"][index]),
+                "confidence": float(data["conf"][index]),
+            }
+        )
+    return [sorted(words, key=lambda word: int(word["left"])) for words in grouped.values()]
+
+
+def _text_and_confidence(data: Dict[str, List]) -> Tuple[str, float, List[List[Dict[str, object]]]]:
+    lines = _group_tesseract_words(data)
+    text = "\n".join(" ".join(str(word["text"]) for word in line) for line in lines)
+    confidences = [
+        float(word["confidence"])
+        for line in lines
+        for word in line
+        if float(word["confidence"]) >= 0
+    ]
+    confidence = float(np.mean(confidences)) if confidences else 0.0
+    return text, confidence, lines
+
+
+def _score_tesseract_result(
+    text: str, confidence: float, lines: List[List[Dict[str, object]]], image_width: int
+) -> Tuple[float, float]:
+    price_centers = []
+    for line in lines:
+        prices = [
+            float(word["left"]) + float(word["width"]) / 2
+            for word in line
+            if re.fullmatch(r"\$?\d{1,5}[.,]\d{2}", str(word["text"]).strip())
+        ]
+        if prices:
+            price_centers.append(max(prices) / max(image_width, 1))
+
+    if len(price_centers) >= 2:
+        spread = float(np.std(price_centers))
+        alignment = max(0.0, min(100.0, 100.0 - spread * 500))
+    elif price_centers:
+        alignment = 35.0
+    else:
+        alignment = 0.0
+
+    quality = score_ocr_quality(text)
+    score = confidence * 0.60 + quality * 0.25 + alignment * 0.15
+    return score, alignment
+
+
+def _scaled_gray(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    height, width = gray.shape[:2]
+    longest_side = max(height, width)
+    if longest_side < 1800:
+        scale = 1800 / longest_side
+    else:
+        scale = min(1.0, 3600 / longest_side)
+    if abs(scale - 1.0) > 0.01:
+        gray = cv2.resize(
+            gray,
+            (int(width * scale), int(height * scale)),
+            interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA,
+        )
+    return gray
+
+
+def _ocr_image_candidates(image: np.ndarray) -> List[Tuple[str, np.ndarray]]:
+    rectified = rectify_receipt(image)
+    candidates: List[Tuple[str, np.ndarray]] = []
+    for name, source in (("original", image), ("rectified", rectified)):
+        gray = _scaled_gray(source)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        variants = [("gray", gray), ("contrast", clahe)]
+        if name == "rectified":
+            threshold = cv2.adaptiveThreshold(
+                clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
+            )
+            variants.append(("adaptive", threshold))
+
+        angles = (0, 90, 180, 270) if name == "original" else (0,)
+        for variant_name, variant in variants:
+            for angle in angles:
+                rotated = variant if angle == 0 else cv2.rotate(
+                    variant,
+                    {
+                        90: cv2.ROTATE_90_CLOCKWISE,
+                        180: cv2.ROTATE_180,
+                        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+                    }[angle],
+                )
+                candidates.append((f"{name}/{variant_name}/{angle}", rotated))
+    return candidates
+
+
+def _refine_price_column(
+    image: np.ndarray, lines: List[List[Dict[str, object]]]
+) -> Optional[str]:
+    height, width = image.shape[:2]
+    price_positions: Dict[int, List[float]] = {}
+    for line_index, line in enumerate(lines):
+        for word in line:
+            if re.fullmatch(r"\$?\d{1,5}[.,]\d{2}", str(word["text"]).strip()):
+                center = float(word["left"]) + float(word["width"]) / 2
+                if center > width * 0.55:
+                    price_positions.setdefault(line_index, []).append(center)
+
+    centers = [max(positions) for positions in price_positions.values()]
+    if len(centers) < 2:
+        return None
+
+    bins: Dict[int, List[float]] = {}
+    for center in centers:
+        bins.setdefault(int(center / max(width * 0.06, 1)), []).append(center)
+    repeated_bins = [values for values in bins.values() if len(values) >= 2]
+    if not repeated_bins:
+        return None
+    column_center = float(np.median(max(repeated_bins, key=lambda values: (len(values), np.median(values)))))
+    column_left = max(0, int(column_center - width * 0.10))
+    refined_lines = []
+    price_pattern = re.compile(r"\$?\d{1,5}[.,]\d{2}")
+
+    for line in lines:
+        line_top = min(int(word["top"]) for word in line)
+        line_bottom = max(int(word["top"]) + int(word["height"]) for word in line)
+        left_words = [
+            str(word["text"])
+            for word in line
+            if float(word["left"]) + float(word["width"]) / 2 < column_left
+        ]
+        if not left_words or not re.search(r"[A-Za-z]{2,}", " ".join(left_words)):
+            refined_lines.append(" ".join(str(word["text"]) for word in line))
+            continue
+
+        crop_top = max(0, line_top - max(3, (line_bottom - line_top) // 3))
+        crop_bottom = min(height, line_bottom + max(3, (line_bottom - line_top) // 3))
+        price_crop = image[crop_top:crop_bottom, column_left:]
+        if price_crop.size == 0:
+            refined_lines.append(" ".join(str(word["text"]) for word in line))
+            continue
+        price_crop = cv2.resize(price_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        price_text = pytesseract.image_to_string(
+            price_crop,
+            config="--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789.$,",
+        )
+        matches = price_pattern.findall(price_text.replace(" ", ""))
+        if matches:
+            price = matches[-1].replace(",", ".").lstrip("$")
+            refined_lines.append(" ".join(left_words + [price]))
+        else:
+            refined_lines.append(" ".join(str(word["text"]) for word in line))
+
+    return "\n".join(refined_lines)
+
+
+def _token_agreement(first: str, second: str) -> float:
+    first_tokens = set(re.findall(r"[a-z0-9]+", first.lower()))
+    second_tokens = set(re.findall(r"[a-z0-9]+", second.lower()))
+    if not first_tokens or not second_tokens:
+        return 0.0
+    return len(first_tokens & second_tokens) / len(first_tokens | second_tokens)
+
+
+def ocr_receipt_to_text(path: str, save_output: bool = True) -> str:
+    """Recognize receipt text, rank image variants, and retry other engines only at low confidence."""
     print(f"[OCR] Processing {os.path.basename(path)}...")
-    
-    # Strategy 0: Try all 4 rotations with Tesseract and score them (fast and effective)
-    print("[OCR] Trying Tesseract with rotation detection...")
+    image = cv2.imread(path)
+    if image is None:
+        print(f"[ERROR] Could not load image: {path}")
+        if save_output:
+            save_fallback_text(path, "[OCR FAILED]")
+        return ""
+
+    best = None
+    candidate_results = []
     try:
-        image = cv2.imread(path)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Scale up for better OCR (2x)
-        height, width = gray.shape
-        scaled = cv2.resize(gray, (width * 2, height * 2), interpolation=cv2.INTER_CUBIC)
-        
-        # Try all 4 rotations
-        rotations = [
-            (scaled, 0, "0°"),
-            (cv2.rotate(scaled, cv2.ROTATE_90_CLOCKWISE), 90, "90°"),
-            (cv2.rotate(scaled, cv2.ROTATE_180), 180, "180°"),
-            (cv2.rotate(scaled, cv2.ROTATE_90_COUNTERCLOCKWISE), 270, "270°"),
-        ]
-        
-        best_text = ""
-        best_score = 0
-        best_angle = "0°"
-        
-        for rotated, angle_deg, angle_str in rotations:
-            # Try two PSM modes and pick best
-            for psm in ['6', '4']:
-                text = ocr_with_tesseract(rotated, f'--psm {psm} --oem 3')
-                score = score_ocr_quality(text)
-                
-                if score > best_score:
-                    best_score = score
-                    best_text = text
-                    best_angle = f"{angle_str} PSM{psm}"
-        
-        if best_text.strip() and best_score > 100:
-            print(f"[OCR] Best result at {best_angle} (score: {best_score}): {len(best_text)} characters")
+        candidates = _ocr_image_candidates(image)
+        for name, candidate_image in candidates:
+            data = pytesseract.image_to_data(
+                candidate_image,
+                config="--psm 6 --oem 3",
+                output_type=pytesseract.Output.DICT,
+            )
+            text, confidence, lines = _text_and_confidence(data)
+            score, alignment = _score_tesseract_result(
+                text, confidence, lines, candidate_image.shape[1]
+            )
+            result = {
+                "name": name,
+                "image": candidate_image,
+                "data": data,
+                "text": text,
+                "confidence": confidence,
+                "lines": lines,
+                "alignment": alignment,
+                "score": score,
+            }
+            candidate_results.append(result)
+            if best is None or score > best["score"]:
+                best = result
+
+        if best is not None:
+            shortlist = sorted(
+                candidate_results, key=lambda result: result["score"], reverse=True
+            )[:3]
+            for candidate_result in shortlist:
+                name = candidate_result["name"]
+                candidate_image = candidate_result["image"]
+                data = pytesseract.image_to_data(
+                    candidate_image,
+                    config="--psm 4 --oem 3",
+                    output_type=pytesseract.Output.DICT,
+                )
+                text, confidence, lines = _text_and_confidence(data)
+                score, alignment = _score_tesseract_result(
+                    text, confidence, lines, candidate_image.shape[1]
+                )
+                if score > best["score"]:
+                    best = {
+                        "name": f"{name}/psm4",
+                        "image": candidate_image,
+                        "data": data,
+                        "text": text,
+                        "confidence": confidence,
+                        "lines": lines,
+                        "alignment": alignment,
+                        "score": score,
+                    }
+    except Exception as error:
+        print(f"[WARN] Tesseract candidate evaluation failed: {error}")
+
+    best_text = best["text"] if best else ""
+    best_confidence = best["confidence"] if best else 0.0
+    best_score = best["score"] if best else 0.0
+    if best and best_text:
+        refined_text = _refine_price_column(best["image"], best["lines"])
+        if refined_text and score_ocr_quality(refined_text) >= score_ocr_quality(best_text):
+            best_text = refined_text
+        print(
+            f"[OCR] Tesseract selected {best['name']} "
+            f"(confidence: {best_confidence:.1f}, score: {best_score:.1f})"
+        )
+
+    if best_confidence < 58 or best_score < 55:
+        print("[OCR] Low Tesseract confidence; checking alternate OCR engines...")
+        tesseract_rank = score_ocr_quality(best_text) * 0.65 + best_confidence * 0.25
+        for engine_name, engine in (("PaddleOCR", try_paddleocr), ("EasyOCR", try_easyocr)):
+            alternative = engine(path)
+            if not alternative.strip():
+                continue
+            agreement = _token_agreement(best_text, alternative)
+            alternative_rank = score_ocr_quality(alternative) * 0.65 + agreement * 10
+            print(
+                f"[OCR] {engine_name} score: {alternative_rank:.1f} "
+                f"(agreement: {agreement:.2f})"
+            )
+            if alternative_rank > tesseract_rank + 5:
+                best_text = alternative
+                tesseract_rank = alternative_rank
+
+    if best_text.strip():
+        if save_output:
             save_fallback_text(path, best_text)
-            return best_text
-    except Exception as e:
-        print(f"[WARN] Tesseract rotation scoring failed: {e}")
-    
-    # Strategy 1: Try PaddleOCR (if Tesseract failed or user wants better accuracy)
-    print("[OCR] Trying PaddleOCR (may take a while on first run)...")
-    paddle_text = try_paddleocr(path)
-    if paddle_text.strip():
-        score = score_ocr_quality(paddle_text)
-        print(f"[OCR] PaddleOCR extracted {len(paddle_text)} characters (score: {score})")
-        save_fallback_text(path, paddle_text)
-        return paddle_text
-    
-    # Strategy 2: Advanced preprocessing with Tesseract
-    print("[OCR] Trying advanced preprocessing with Tesseract...")
-    try:
-        preprocessed = preprocess_image_advanced(path)
-        
-        # Try different PSM modes
-        configs = [
-            '--psm 4 --oem 3',  # Single column
-            '--psm 3 --oem 3',  # Fully automatic
-        ]
-        
-        best_text = ""
-        best_score = 0
-        
-        for config in configs:
-            text = ocr_with_tesseract(preprocessed, config)
-            score = score_ocr_quality(text)
-            if score > best_score:
-                best_score = score
-                best_text = text
-        
-        if best_text.strip() and best_score > 100:
-            print(f"[OCR] Advanced method extracted {len(best_text)} characters (score: {best_score})")
-            save_fallback_text(path, best_text)
-            return best_text
-    
-    except Exception as e:
-        print(f"[WARN] Advanced preprocessing failed: {e}")
-    
-    # Strategy 3: Fallback to EasyOCR
-    print("[OCR] Trying EasyOCR as last resort...")
-    easy_text = try_easyocr(path)
-    if easy_text.strip():
-        score = score_ocr_quality(easy_text)
-        print(f"[OCR] EasyOCR extracted {len(easy_text)} characters (score: {score})")
-        save_fallback_text(path, easy_text)
-        return easy_text
-    
-    # Last resort: return empty
+        return best_text
+
     print("[ERROR] All OCR strategies failed")
-    save_fallback_text(path, "[OCR FAILED]")
+    if save_output:
+        save_fallback_text(path, "[OCR FAILED]")
     return ""
 
 # ========== CONFIG ==========
@@ -354,9 +663,10 @@ def parse_items_from_ocr_text(ocr_text: str) -> List[ReceiptItem]:
     # Keywords to skip
     skip_keywords = [
         "subtotal", "total", "tax", "change", "tender", "visa", "mastercard",
-        "debit", "credit", "balance", "cash", "amount due", "amt due", "payment",
+        "debit", "credit", "balance", "cash", "amount", "amt due", "payment",
         "card", "ref:", "auth:", "aid", "tvr", "****", "----", "store director",
         "main:", "phone", "cashier", "refrig", "frozen", "your cashier",
+        "savings", "discount", "coupon", "you saved",
     ]
 
     for raw_line in ocr_text.splitlines():
@@ -542,6 +852,20 @@ def fuzzy_canonical_name(raw_name: str, existing: List[str], score_cutoff=88) ->
     )
 
     if best is None:
+        if len(base) < 5:
+            return base
+
+        vectorizer = TfidfVectorizer(
+            analyzer="char_wb", ngram_range=(2, 4), sublinear_tf=True
+        )
+        normalized_existing = [normalize_raw_name(name) for name in existing]
+        matrix = vectorizer.fit_transform([base, *normalized_existing])
+        similarities = cosine_similarity(matrix[0:1], matrix[1:]).ravel()
+        ranked_indices = similarities.argsort()[::-1]
+        best_index = int(ranked_indices[0])
+        second_best = similarities[ranked_indices[1]] if len(ranked_indices) > 1 else 0.0
+        if similarities[best_index] >= 0.72 and similarities[best_index] - second_best >= 0.08:
+            return existing[best_index]
         return base
 
     best_name, best_score, _ = best

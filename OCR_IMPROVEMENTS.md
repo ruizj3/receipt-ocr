@@ -5,23 +5,13 @@ This version uses enhanced OCR techniques without LLM dependencies, focusing on 
 
 ## Key Improvements
 
-### 1. **Multi-Strategy OCR Approach**
-The system now tries multiple OCR strategies in sequence:
-
-- **Strategy 1**: Advanced preprocessing + rotation detection
-  - Denoising using Non-Local Means algorithm
-  - Adaptive thresholding (better than global threshold)
-  - Morphological operations to clean noise
-  - Automatic rotation detection and correction
-  - Multiple Tesseract PSM modes (6, 4, 3)
-
-- **Strategy 2**: Brute-force rotation testing
-  - Tests all 4 possible rotations (0°, 90°, 180°, 270°)
-  - Selects the rotation with the most extracted text
-
-- **Strategy 3**: EasyOCR fallback
-  - Uses deep learning-based OCR when Tesseract fails
-  - More robust for difficult/degraded images
+### 1. **Confidence-Guided OCR**
+- Detects a clear receipt quadrilateral and corrects perspective when possible.
+- Compares grayscale, CLAHE contrast-enhanced, and adaptive-threshold variants, including rotations.
+- Ranks Tesseract candidates using word confidence, readable item lines, price presence, and price-column alignment.
+- Rechecks the strongest image variants with Tesseract's single-column mode.
+- Re-OCRs aligned right-side price cells with a numeric character whitelist and associates them with their text rows.
+- Tries PaddleOCR and EasyOCR only when Tesseract confidence is low; alternative results are ranked by readable receipt content and agreement with the primary output.
 
 ### 2. **Enhanced Parsing**
 Improved regex patterns to handle multiple receipt formats:
@@ -82,9 +72,13 @@ python receipt_scanner.py
    - Applies adaptive thresholding
    - Removes artifacts
 3. **Rotation Detection**: Automatically detects and corrects orientation
-4. **OCR Extraction**: Runs Tesseract with optimized settings
-5. **Parsing**: Extracts items using enhanced regex patterns
-6. **Output**: Saves to CSV with product, store, date, and price
+4. **OCR Extraction**: Compares preprocessing and segmentation candidates using confidence and receipt layout
+5. **Price Recognition**: Re-reads an aligned price column and retries alternate OCR engines only at low confidence
+6. **Parsing**: Extracts items using enhanced regex patterns
+7. **Output**: Saves to CSV with product, store, date, and price
+
+### Evaluate OCR Changes
+Run `python evaluate_ocr.py --limit 1` for a quick comparison, or omit `--limit` to process the receipt corpus. The existing fallback text files are previous OCR outputs, not manually verified ground truth, so edit distance reports similarity to the old output rather than true recognition accuracy. The evaluator does not overwrite those reference files.
 
 ## Troubleshooting
 
