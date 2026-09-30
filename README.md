@@ -40,3 +40,34 @@ Safeway receipt: 2/2 items ✅
 Trader Joe's receipt: 8/14 items ✅
 Automatic rotation detection working perfectly
 Clean product names (removes artifacts like "ff", "&f")
+
+## Docker
+
+Build and run the Python API from this directory:
+
+```sh
+docker build -t receipt-ocr-api:local .
+docker run --rm -p 8000:8000 receipt-ocr-api:local
+```
+
+The API accepts receipt images at `/api/extract` and returns parsed line items.
+With the container running, check its health and submit a sample receipt from a
+second terminal:
+
+```sh
+curl http://localhost:8000/api/health
+curl -X POST -F "file=@receipts/Safeway20250505.jpg" \
+	http://localhost:8000/api/extract
+```
+
+For the complete UI and API workflow, use Docker Compose from the sibling
+`receipt-ocr-ui` repository; see its [Docker instructions](../receipt-ocr-ui/README.md#docker).
+
+For batch processing of the mounted `receipts/` directory, run:
+
+```sh
+docker run --rm --entrypoint python -v "$PWD:/workspace" -w /workspace \
+	receipt-ocr-api:local /app/receipt_scanner.py
+```
+
+The image includes Tesseract and the Python OCR dependencies.
