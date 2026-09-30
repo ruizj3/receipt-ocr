@@ -1,0 +1,9 @@
+.git
+.DS_Store
+__pycache__
+*.py[cod]
+receipt_history_env
+.venv
+receipts
+receipts_ocr_text
+*.csv
