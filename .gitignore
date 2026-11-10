@@ -209,3 +209,4 @@ __marimo__/
 receipts/
 receipts_ocr_text/
 .DS_Store
+*.csv
