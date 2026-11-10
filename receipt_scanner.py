@@ -877,11 +877,13 @@ def build_price_history(receipt_dir: str):
     """
     Go through all receipt images, extract data via OCR, and build a price history per product.
     Returns:
-      - price_history: { product_name -> list[(store_name, date, price)] }
+            - price_history: { product_name -> list[(store_name, date, price, filename)] }
       - successes: list of image paths processed successfully
       - failures:  list of (image_path, reason) for failures
     """
-    price_history: Dict[str, List[Tuple[Optional[str], Optional[datetime], Optional[float]]]] = {}
+    price_history: Dict[
+        str, List[Tuple[Optional[str], Optional[datetime], Optional[float], str]]
+    ] = {}
     successes: List[str] = []
     failures: List[Tuple[str, str]] = []
 
@@ -911,7 +913,9 @@ def build_price_history(receipt_dir: str):
                 price_history[canonical_name] = []
 
             price = item.unit_price if item.unit_price is not None else item.total_price
-            price_history[canonical_name].append((store_name, purchase_dt, price))
+            price_history[canonical_name].append(
+                (store_name, purchase_dt, price, os.path.basename(image_path))
+            )
 
         del receipt  # drop reference ASAP
 
@@ -919,19 +923,21 @@ def build_price_history(receipt_dir: str):
     for product, entries in price_history.items():
         price_history[product] = sorted(
             entries,
-            key=lambda x: (x[1] is None, x[1] or datetime.max),  # x = (store, date, price)
+            key=lambda x: (x[1] is None, x[1] or datetime.max),
         )
 
     return price_history, successes, failures
 
 
 def print_price_history(
-    price_history: Dict[str, List[Tuple[Optional[str], Optional[datetime], Optional[float]]]]
+    price_history: Dict[
+        str, List[Tuple[Optional[str], Optional[datetime], Optional[float], str]]
+    ]
 ):
     print("\n===== PRICE HISTORY =====")
     for product, entries in sorted(price_history.items()):
         print(f"\n📦 {product}")
-        for store_name, dt, price in entries:
+        for store_name, dt, price, _ in entries:
             store_str = store_name or "unknown-store"
             date_str = dt.strftime("%Y-%m-%d") if dt else "unknown-date"
             if isinstance(price, (int, float)) and price is not None:
@@ -945,16 +951,19 @@ def main():
     price_history, successes, failures = build_price_history(RECEIPT_DIR)
     print_price_history(price_history)
 
-    # Write CSV with store, product, date, price
+    # Write CSV with filename, store, product, date, and price
     out_csv = "receipt_price_history.csv"
     with open(out_csv, "w", encoding="utf-8") as f:
-        f.write("store_name,product_name,date,price\n")
+        f.write("filename,store_name,product_name,date,price\n")
         for product, entries in price_history.items():
-            for store_name, dt, price in entries:
+            for store_name, dt, price, filename in entries:
+                filename_str = filename.replace('"', '""')
                 store_str = store_name or ""
                 date_str = dt.strftime("%Y-%m-%d") if dt else ""
                 price_str = str(price) if price is not None else ""
-                f.write(f"\"{store_str}\",\"{product}\",{date_str},{price_str}\n")
+                f.write(
+                    f'"{filename_str}","{store_str}","{product}",{date_str},{price_str}\n'
+                )
 
     print(f"\n✅ Done. CSV written to {out_csv}")
 
