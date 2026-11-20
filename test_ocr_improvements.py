@@ -5,9 +5,16 @@ import numpy as np
 import cv2
 
 from receipt_scanner import (
+    OLLAMA_RECEIPT_PROMPT,
+    ReceiptItem,
+    _parse_items_from_tesseract_lines,
     _refine_price_column,
     _score_tesseract_result,
     _clip_easyocr_horizontal_boxes,
+    _output_csv_paths,
+    extract_receipt_data_from_ocr,
+    ocr_receipt_to_text,
+    parse_args,
     rectify_receipt,
     try_paddleocr,
 )
@@ -31,6 +38,73 @@ def test_tesseract_confidence_and_price_alignment_raise_score():
 
     assert alignment > 90
     assert high_score > low_score
+
+
+def test_tesseract_candidate_score_rewards_successfully_parsed_rows():
+    lines = [
+        [
+            {"text": "MILK", "left": 100, "top": 10, "width": 100, "height": 20, "confidence": 90},
+            {"text": "2.79", "left": 850, "top": 10, "width": 50, "height": 20, "confidence": 90},
+        ],
+        [
+            {"text": "BREAD", "left": 100, "top": 40, "width": 120, "height": 20, "confidence": 90},
+            {"text": "3.49", "left": 852, "top": 40, "width": 50, "height": 20, "confidence": 90},
+        ],
+    ]
+    text = "MILK 2.79\nBREAD 3.49"
+
+    text_only_score, _ = _score_tesseract_result(text, 90, lines, 1000)
+    parsed_score, _ = _score_tesseract_result(text, 90, lines, 1000, 2)
+
+    assert parsed_score > text_only_score
+
+
+def test_tesseract_parser_uses_word_positions_to_select_rightmost_price():
+    lines = [[
+        {"text": "MILK", "left": 100, "top": 10, "width": 80, "height": 20, "confidence": 90},
+        {"text": "3.49", "left": 850, "top": 10, "width": 50, "height": 20, "confidence": 90},
+        {"text": "2.79", "left": 700, "top": 10, "width": 50, "height": 20, "confidence": 90},
+    ]]
+
+    items = _parse_items_from_tesseract_lines(lines)
+
+    assert [(item.product_name, item.total_price) for item in items] == [("MILK", 3.49)]
+
+
+def test_receipt_extraction_uses_structured_tesseract_items():
+    positioned_item = ReceiptItem(product_name="MILK", total_price=2.79)
+
+    def fake_ocr(*args, **kwargs):
+        kwargs["metadata"]["selected_engine"] = "Tesseract"
+        kwargs["metadata"]["parsed_items"] = [positioned_item]
+        return "MILK 99.99"
+
+    with patch("receipt_scanner.ocr_receipt_to_text", side_effect=fake_ocr):
+        receipt, error = extract_receipt_data_from_ocr("receipt.jpg", {})
+
+    assert error is None
+    assert receipt is not None
+    assert [(item.product_name, item.total_price) for item in receipt.items] == [
+        ("MILK", 2.79)
+    ]
+
+
+def test_receipt_extraction_ignores_tesseract_items_after_engine_fallback():
+    positioned_item = ReceiptItem(product_name="MILK", total_price=2.79)
+
+    def fake_ocr(*args, **kwargs):
+        kwargs["metadata"]["selected_engine"] = "EasyOCR"
+        kwargs["metadata"]["parsed_items"] = [positioned_item]
+        return "BREAD 3.49"
+
+    with patch("receipt_scanner.ocr_receipt_to_text", side_effect=fake_ocr):
+        receipt, error = extract_receipt_data_from_ocr("receipt.jpg", {})
+
+    assert error is None
+    assert receipt is not None
+    assert [(item.product_name, item.total_price) for item in receipt.items] == [
+        ("BREAD", 3.49)
+    ]
 
 
 def test_price_column_reocr_preserves_rows_and_uses_whitelisted_text():
@@ -118,3 +192,74 @@ def test_easyocr_boxes_are_clipped_and_empty_boxes_rejected():
         [0, 50, 5, 30],
         [900, 1000, 10, 40],
     ]
+
+
+def test_ollama_ocr_uses_requested_model_and_image():
+    requests = []
+    ollama_module = types.ModuleType("ollama")
+    ollama_module.chat = lambda **kwargs: (
+        requests.append(kwargs) or {"message": {"content": "MILK 2.79"}}
+    )
+    metadata = {}
+
+    with (
+        patch.dict("sys.modules", {"ollama": ollama_module}),
+        patch("receipt_scanner.cv2.imread", return_value=np.zeros((20, 20, 3))),
+    ):
+        text = ocr_receipt_to_text(
+            "receipt.jpg",
+            save_output=False,
+            metadata=metadata,
+            engine="ollama",
+            ollama_model="qwen2.5vl:7b",
+        )
+
+    assert text == "MILK 2.79"
+    assert requests[0]["model"] == "qwen2.5vl:7b"
+    assert requests[0]["messages"][0]["content"] == OLLAMA_RECEIPT_PROMPT
+    assert "all printed price columns" in OLLAMA_RECEIPT_PROMPT
+    assert "left-to-right order" in OLLAMA_RECEIPT_PROMPT
+    assert requests[0]["messages"][0]["images"] == ["receipt.jpg"]
+    assert metadata["selected_engine"] == "Ollama/qwen2.5vl:7b"
+    assert metadata["tesseract_confidence"] is None
+
+
+def test_ollama_ocr_saves_to_a_separate_model_specific_file():
+    ollama_module = types.ModuleType("ollama")
+    ollama_module.chat = lambda **kwargs: {"message": {"content": "MILK 2.79"}}
+
+    with (
+        patch.dict("sys.modules", {"ollama": ollama_module}),
+        patch("receipt_scanner.cv2.imread", return_value=np.zeros((20, 20, 3))),
+        patch("receipt_scanner.save_fallback_text") as save_text,
+    ):
+        ocr_receipt_to_text(
+            "receipt.jpg", engine="ollama", ollama_model="qwen2.5vl:7b"
+        )
+
+    save_text.assert_called_once_with(
+        "receipt.jpg", "MILK 2.79", "ollama_qwen2_5-vl"
+    )
+
+
+def test_ocr_engine_cli_defaults_to_tesseract_and_accepts_ollama():
+    defaults = parse_args([])
+    ollama_args = parse_args(
+        ["--ocr-engine", "ollama", "--ollama-model", "qwen2.5vl:7b"]
+    )
+
+    assert defaults.ocr_engine == "tesseract"
+    assert defaults.ollama_model == "qwen2.5vl:7b"
+    assert ollama_args.ocr_engine == "ollama"
+    assert ollama_args.ollama_model == "qwen2.5vl:7b"
+
+
+def test_ollama_csv_paths_are_separate_and_model_specific():
+    assert _output_csv_paths("tesseract", "qwen2.5vl:7b") == (
+        "receipt_price_history.csv",
+        "receipt_processing_summary.csv",
+    )
+    assert _output_csv_paths("ollama", "qwen2.5vl:7b") == (
+        "receipt_price_history_ollama_qwen2_5vl_7b.csv",
+        "receipt_processing_summary_ollama_qwen2_5vl_7b.csv",
+    )
