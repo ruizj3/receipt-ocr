@@ -1,5 +1,10 @@
+import argparse
+import contextlib
+import csv
+import io
 import os
 import re
+import sys
 from importlib.util import find_spec
 from inspect import signature
 from datetime import datetime
@@ -145,10 +150,12 @@ def detect_and_correct_rotation(image: np.ndarray) -> np.ndarray:
     return image
 
 
-def save_fallback_text(image_path: str, ocr_text: str) -> None:
+def save_fallback_text(
+    image_path: str, ocr_text: str, suffix: str = "fallback"
+) -> None:
     """
     Save the OCR text for fallback receipts to a .txt file.
-    Output goes to: ./receipts_ocr_text/<receiptname>_fallback.txt
+    Output goes to: ./receipts_ocr_text/<receiptname>_<suffix>.txt
     """
     # Ensure output directory exists
     out_dir = "./receipts_ocr_text"
@@ -159,7 +166,7 @@ def save_fallback_text(image_path: str, ocr_text: str) -> None:
     stem = os.path.splitext(base)[0]             # "Safeway20250726"
 
     # Build output path
-    txt_path = os.path.join(out_dir, f"{stem}_fallback.txt")
+    txt_path = os.path.join(out_dir, f"{stem}_{suffix}.txt")
 
     try:
         with open(txt_path, "w", encoding="utf-8") as f:
@@ -373,7 +380,11 @@ def _text_and_confidence(data: Dict[str, List]) -> Tuple[str, float, List[List[D
 
 
 def _score_tesseract_result(
-    text: str, confidence: float, lines: List[List[Dict[str, object]]], image_width: int
+    text: str,
+    confidence: float,
+    lines: List[List[Dict[str, object]]],
+    image_width: int,
+    parsed_item_count: int = 0,
 ) -> Tuple[float, float]:
     price_centers = []
     for line in lines:
@@ -394,7 +405,19 @@ def _score_tesseract_result(
         alignment = 0.0
 
     quality = score_ocr_quality(text)
-    score = confidence * 0.60 + quality * 0.25 + alignment * 0.15
+    item_lines = sum(
+        bool(re.search(r"[A-Za-z]{2,}", line)
+             and re.search(r"\d{1,5}[.,]\d{2}", line))
+        for line in text.splitlines()
+    )
+    parse_coverage = min(1.0, parsed_item_count / item_lines) if item_lines else 0.0
+    parse_score = parse_coverage * 100
+    score = (
+        confidence * 0.50
+        + quality * 0.20
+        + alignment * 0.15
+        + parse_score * 0.15
+    )
     return score, alignment
 
 
@@ -511,15 +534,77 @@ def _token_agreement(first: str, second: str) -> float:
     return len(first_tokens & second_tokens) / len(first_tokens | second_tokens)
 
 
-def ocr_receipt_to_text(path: str, save_output: bool = True) -> str:
+OLLAMA_RECEIPT_PROMPT = (
+    "Transcribe every visible line on this receipt verbatim. Keep one printed "
+    "line per output line. Preserve item descriptions, digits, decimal points, "
+    "symbols, and all printed price columns in their original left-to-right "
+    "order, including repeated prices. Do not calculate, normalize, summarize, "
+    "or omit text, and do not add labels or commentary. Return only the "
+    "transcription."
+)
+
+
+def ocr_with_ollama(path: str, model: str) -> str:
+    """Transcribe a receipt image with an Ollama vision model."""
+    try:
+        import ollama
+    except ImportError as error:
+        raise RuntimeError(
+            "Ollama mode requires the Python package. Install it with: pip install ollama"
+        ) from error
+
+    print(f"[OCR] Sending image to Ollama model {model}...")
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": OLLAMA_RECEIPT_PROMPT,
+                "images": [path],
+            }
+        ],
+    )
+    text = response["message"]["content"].strip()
+    if not text:
+        raise RuntimeError(f"Ollama model {model} returned no text")
+    return text
+
+
+def ocr_receipt_to_text(
+    path: str,
+    save_output: bool = True,
+    metadata: Optional[Dict[str, object]] = None,
+    engine: str = "tesseract",
+    ollama_model: str = "qwen2.5vl:7b",
+) -> str:
     """Recognize receipt text, rank image variants, and retry other engines only at low confidence."""
     print(f"[OCR] Processing {os.path.basename(path)}...")
+    if metadata is not None:
+        metadata.clear()
     image = cv2.imread(path)
     if image is None:
         print(f"[ERROR] Could not load image: {path}")
         if save_output:
             save_fallback_text(path, "[OCR FAILED]")
         return ""
+
+    if engine == "ollama":
+        text = ocr_with_ollama(path, ollama_model)
+        if metadata is not None:
+            metadata.update(
+                {
+                    "selected_engine": f"Ollama/{ollama_model}",
+                    "tesseract_confidence": None,
+                    "tesseract_score": None,
+                    "low_confidence": False,
+                }
+            )
+        if save_output:
+            model_suffix = _safe_model_suffix(ollama_model)
+            save_fallback_text(path, text, f"ollama_{model_suffix}")
+        return text
+    if engine != "tesseract":
+        raise ValueError(f"Unsupported OCR engine: {engine}")
 
     best = None
     candidate_results = []
@@ -532,8 +617,9 @@ def ocr_receipt_to_text(path: str, save_output: bool = True) -> str:
                 output_type=pytesseract.Output.DICT,
             )
             text, confidence, lines = _text_and_confidence(data)
+            parsed_items = _parse_items_from_tesseract_lines(lines)
             score, alignment = _score_tesseract_result(
-                text, confidence, lines, candidate_image.shape[1]
+                text, confidence, lines, candidate_image.shape[1], len(parsed_items)
             )
             result = {
                 "name": name,
@@ -544,6 +630,7 @@ def ocr_receipt_to_text(path: str, save_output: bool = True) -> str:
                 "lines": lines,
                 "alignment": alignment,
                 "score": score,
+                "parsed_items": parsed_items,
             }
             candidate_results.append(result)
             if best is None or score > best["score"]:
@@ -562,8 +649,9 @@ def ocr_receipt_to_text(path: str, save_output: bool = True) -> str:
                     output_type=pytesseract.Output.DICT,
                 )
                 text, confidence, lines = _text_and_confidence(data)
+                parsed_items = _parse_items_from_tesseract_lines(lines)
                 score, alignment = _score_tesseract_result(
-                    text, confidence, lines, candidate_image.shape[1]
+                    text, confidence, lines, candidate_image.shape[1], len(parsed_items)
                 )
                 if score > best["score"]:
                     best = {
@@ -575,6 +663,7 @@ def ocr_receipt_to_text(path: str, save_output: bool = True) -> str:
                         "lines": lines,
                         "alignment": alignment,
                         "score": score,
+                        "parsed_items": parsed_items,
                     }
     except Exception as error:
         print(f"[WARN] Tesseract candidate evaluation failed: {error}")
@@ -582,16 +671,30 @@ def ocr_receipt_to_text(path: str, save_output: bool = True) -> str:
     best_text = best["text"] if best else ""
     best_confidence = best["confidence"] if best else 0.0
     best_score = best["score"] if best else 0.0
+    low_confidence = best_confidence < 58 or best_score < 55
+    selected_engine = "Tesseract" if best_text.strip() else "none"
+    if metadata is not None:
+        metadata.update(
+            {
+                "selected_engine": selected_engine,
+                "tesseract_confidence": best_confidence,
+                "tesseract_score": best_score,
+                "low_confidence": low_confidence,
+            }
+        )
     if best and best_text:
         refined_text = _refine_price_column(best["image"], best["lines"])
         if refined_text and score_ocr_quality(refined_text) >= score_ocr_quality(best_text):
             best_text = refined_text
+        best["parsed_items"] = _parse_items_from_tesseract_lines(
+            best["lines"], best_text
+        )
         print(
             f"[OCR] Tesseract selected {best['name']} "
             f"(confidence: {best_confidence:.1f}, score: {best_score:.1f})"
         )
 
-    if best_confidence < 58 or best_score < 55:
+    if low_confidence:
         print("[OCR] Low Tesseract confidence; checking alternate OCR engines...")
         tesseract_rank = score_ocr_quality(best_text) * 0.65 + best_confidence * 0.25
         for engine_name, engine in (("PaddleOCR", try_paddleocr), ("EasyOCR", try_easyocr)):
@@ -607,6 +710,15 @@ def ocr_receipt_to_text(path: str, save_output: bool = True) -> str:
             if alternative_rank > tesseract_rank + 5:
                 best_text = alternative
                 tesseract_rank = alternative_rank
+                selected_engine = engine_name
+
+    if metadata is not None:
+        metadata["selected_engine"] = selected_engine
+        metadata["parsed_items"] = (
+            best["parsed_items"]
+            if best and selected_engine == "Tesseract"
+            else []
+        )
 
     if best_text.strip():
         if save_output:
@@ -752,6 +864,49 @@ def parse_items_from_ocr_text(ocr_text: str) -> List[ReceiptItem]:
 
     return items
 
+
+def _parse_items_from_tesseract_lines(
+    lines: List[List[Dict[str, object]]], refined_text: Optional[str] = None
+) -> List[ReceiptItem]:
+    """Parse positioned Tesseract words, using the rightmost price in each row."""
+    items: List[ReceiptItem] = []
+    refined_lines = refined_text.splitlines() if refined_text else []
+    price_pattern = re.compile(r"\$?\d{1,5}[.,]\d{2}")
+
+    for line_index, words in enumerate(lines):
+        price_words = [
+            word for word in words
+            if price_pattern.fullmatch(str(word["text"]).strip())
+        ]
+        if not price_words:
+            continue
+
+        rightmost_price = max(
+            price_words,
+            key=lambda word: int(word["left"]) + int(word["width"]),
+        )
+        price_left = int(rightmost_price["left"])
+        description_words = [
+            str(word["text"])
+            for word in words
+            if int(word["left"]) + int(word["width"]) / 2 < price_left
+            and not price_pattern.fullmatch(str(word["text"]).strip())
+        ]
+        description = " ".join(description_words).strip()
+        if not re.search(r"[A-Za-z]{2,}", description):
+            continue
+
+        price_text = str(rightmost_price["text"]).strip()
+        if line_index < len(refined_lines):
+            refined_prices = price_pattern.findall(refined_lines[line_index])
+            if refined_prices:
+                price_text = refined_prices[-1]
+        price_text = price_text.replace(",", ".").lstrip("$")
+        row_items = parse_items_from_ocr_text(f"{description} {price_text}")
+        items.extend(row_items)
+
+    return items
+
 def fallback_receipt_from_ocr_text(image_path: str, ocr_text: str) -> Optional[Receipt]:
     """
     Build a Receipt from OCR text using simple regex parsing.
@@ -775,13 +930,13 @@ def extract_store_and_date_from_filename(path: str) -> Tuple[Optional[str], Opti
     base = os.path.basename(path)
     name, _ = os.path.splitext(base)
 
-    # Match an 8-digit date at the end: YYYYMMDD
-    m = re.search(r'(\d{8})$', name)
+    # Allow common duplicate-name suffixes after the YYYYMMDD date.
+    m = re.fullmatch(r"(?P<store>.+?)(?P<date>\d{8})(?:(?:\(\d+\))|(?:[_-]\d+))*", name)
     if not m:
         return None, None
 
-    date_str = m.group(1)      # e.g. "20250424"
-    store = name[:m.start()]   # everything before the date
+    date_str = m.group("date")
+    store = m.group("store")
 
     try:
         dt = datetime.strptime(date_str, "%Y%m%d")
@@ -795,6 +950,9 @@ def extract_store_and_date_from_filename(path: str) -> Tuple[Optional[str], Opti
 
 def extract_receipt_data_from_ocr(
     image_path: str,
+    ocr_metadata: Optional[Dict[str, object]] = None,
+    ocr_engine: str = "tesseract",
+    ollama_model: str = "qwen2.5vl:7b",
 ) -> Tuple[Optional[Receipt], Optional[str]]:
     """
     Extract structured data from a receipt image using OCR only (no LLM).
@@ -803,10 +961,23 @@ def extract_receipt_data_from_ocr(
     """
     try:
         # Get OCR text from the receipt
-        ocr_text = ocr_receipt_to_text(image_path)
+        ocr_text = ocr_receipt_to_text(
+            image_path,
+            metadata=ocr_metadata,
+            engine=ocr_engine,
+            ollama_model=ollama_model,
+        )
         
-        # Parse items from OCR text using rule-based parsing
-        receipt = fallback_receipt_from_ocr_text(image_path, ocr_text)
+        # Tesseract parsing keeps word positions; other engines use transcript text.
+        parsed_items = (
+            ocr_metadata.get("parsed_items")
+            if ocr_metadata and ocr_metadata.get("selected_engine") == "Tesseract"
+            else None
+        )
+        if isinstance(parsed_items, list) and parsed_items:
+            receipt = Receipt(items=parsed_items)
+        else:
+            receipt = fallback_receipt_from_ocr_text(image_path, ocr_text)
         
         if receipt is None or not receipt.items:
             print(f"[WARN] No items could be parsed from {image_path}")
@@ -873,32 +1044,84 @@ def fuzzy_canonical_name(raw_name: str, existing: List[str], score_cutoff=88) ->
 
 
 # ========== MAIN PIPELINE ==========
-def build_price_history(receipt_dir: str):
+PRICE_REVIEW_THRESHOLD = 100.0
+
+
+def _price_review_flags(
+    price: Optional[float], ocr_metadata: Dict[str, object]
+) -> List[str]:
+    flags = []
+    if ocr_metadata.get("low_confidence"):
+        flags.append("low_ocr_confidence")
+    if price is not None and price > PRICE_REVIEW_THRESHOLD:
+        flags.append("price_over_100")
+    if price is not None and price <= 0:
+        flags.append("nonpositive_price")
+    return flags
+
+
+class _TeeOutput:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def build_price_history(
+    receipt_dir: str,
+    processing_summaries: Optional[List[Tuple[str, str]]] = None,
+    ocr_metadata_by_file: Optional[Dict[str, Dict[str, object]]] = None,
+    ocr_engine: str = "tesseract",
+    ollama_model: str = "qwen2.5vl:7b",
+):
     """
     Go through all receipt images, extract data via OCR, and build a price history per product.
     Returns:
-            - price_history: { product_name -> list[(store_name, date, price, filename)] }
-      - successes: list of image paths processed successfully
-      - failures:  list of (image_path, reason) for failures
+        - price_history: { product_name -> list[(store_name, date, price, filename)] }
+                - successes: list of image paths processed successfully
+                - failures:  list of (image_path, reason) for failures
     """
     price_history: Dict[
         str, List[Tuple[Optional[str], Optional[datetime], Optional[float], str]]
     ] = {}
     successes: List[str] = []
     failures: List[Tuple[str, str]] = []
+    if processing_summaries is None:
+        processing_summaries = []
 
     for image_path in iter_receipt_images(receipt_dir):
-        print(f"🧾 Processing {image_path} ...")
+        filename = os.path.basename(image_path)
+        output = io.StringIO()
+        ocr_metadata: Dict[str, object] = {}
+        with contextlib.redirect_stdout(_TeeOutput(sys.stdout, output)):
+            print(f"🧾 Processing {image_path} ...")
+            receipt, error_reason = extract_receipt_data_from_ocr(
+                image_path, ocr_metadata, ocr_engine, ollama_model
+            )
+
+        if ocr_metadata_by_file is not None:
+            ocr_metadata_by_file[filename] = ocr_metadata
 
         store_name, purchase_dt = extract_store_and_date_from_filename(image_path)
-
-        receipt, error_reason = extract_receipt_data_from_ocr(image_path)
+        summary = output.getvalue().strip()
 
         if receipt is None:
-            failures.append((image_path, error_reason or "unknown"))
+            reason = error_reason or "unknown"
+            failures.append((image_path, reason))
+            processing_summaries.append(
+                (filename, f"{summary}\nResult: failed ({reason})")
+            )
             continue
 
         successes.append(image_path)
+        receipt_review_flags = set()
 
         for item in receipt.items:
             if not item.product_name:
@@ -913,10 +1136,23 @@ def build_price_history(receipt_dir: str):
                 price_history[canonical_name] = []
 
             price = item.unit_price if item.unit_price is not None else item.total_price
+            receipt_review_flags.update(_price_review_flags(price, ocr_metadata))
             price_history[canonical_name].append(
-                (store_name, purchase_dt, price, os.path.basename(image_path))
+                (store_name, purchase_dt, price, filename)
             )
 
+        if receipt_review_flags:
+            result = "Result: parsed, review required (" + ", ".join(
+                sorted(receipt_review_flags)
+            ) + f"; {len(receipt.items)} items)"
+        else:
+            result = (
+                f"Result: parsed, not accuracy-verified ({len(receipt.items)} items; "
+                "no automatic review flags)"
+            )
+        processing_summaries.append(
+            (filename, f"{summary}\n{result}")
+        )
         del receipt  # drop reference ASAP
 
     # Sort each product's entries by date (None at the end)
@@ -927,6 +1163,56 @@ def build_price_history(receipt_dir: str):
         )
 
     return price_history, successes, failures
+
+
+def _write_price_history_csv(
+    path: str,
+    price_history: Dict[
+        str, List[Tuple[Optional[str], Optional[datetime], Optional[float], str]]
+    ],
+    ocr_metadata_by_file: Dict[str, Dict[str, object]],
+) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "filename",
+                "store_name",
+                "product_name",
+                "date",
+                "price",
+                "selected_ocr_engine",
+                "tesseract_confidence",
+                "review_flags",
+            ]
+        )
+        for product, entries in price_history.items():
+            for store_name, dt, price, filename in entries:
+                metadata = ocr_metadata_by_file.get(filename, {})
+                writer.writerow(
+                    [
+                        filename,
+                        store_name or "",
+                        product,
+                        dt.strftime("%Y-%m-%d") if dt else "",
+                        price if price is not None else "",
+                        metadata.get("selected_engine", ""),
+                        metadata.get("tesseract_confidence", ""),
+                        ";".join(_price_review_flags(price, metadata)),
+                    ]
+                )
+
+
+def _safe_model_suffix(model: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", model).strip("_") or "model"
+
+
+def _output_csv_paths(ocr_engine: str, ollama_model: str) -> Tuple[str, str]:
+    suffix = f"_ollama_{_safe_model_suffix(ollama_model)}" if ocr_engine == "ollama" else ""
+    return (
+        f"receipt_price_history{suffix}.csv",
+        f"receipt_processing_summary{suffix}.csv",
+    )
 
 
 def print_price_history(
@@ -947,30 +1233,51 @@ def print_price_history(
             print(f"  {date_str} @ {store_str}: {price_str}")
 
 
-def main():
-    price_history, successes, failures = build_price_history(RECEIPT_DIR)
+def parse_args(argv: Optional[List[str]] = None):
+    parser = argparse.ArgumentParser(description="Extract receipt text and build price history.")
+    parser.add_argument(
+        "--ocr-engine",
+        choices=("tesseract", "ollama"),
+        default="tesseract",
+        help="OCR engine to use (default: tesseract).",
+    )
+    parser.add_argument(
+        "--ollama-model",
+        default="qwen2.5vl:7b",
+        help="Ollama vision model to use when --ocr-engine=ollama.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None):
+    args = parse_args(argv)
+    processing_summaries: List[Tuple[str, str]] = []
+    ocr_metadata_by_file: Dict[str, Dict[str, object]] = {}
+    price_history, successes, failures = build_price_history(
+        RECEIPT_DIR,
+        processing_summaries,
+        ocr_metadata_by_file,
+        args.ocr_engine,
+        args.ollama_model,
+    )
     print_price_history(price_history)
 
-    # Write CSV with filename, store, product, date, and price
-    out_csv = "receipt_price_history.csv"
-    with open(out_csv, "w", encoding="utf-8") as f:
-        f.write("filename,store_name,product_name,date,price\n")
-        for product, entries in price_history.items():
-            for store_name, dt, price, filename in entries:
-                filename_str = filename.replace('"', '""')
-                store_str = store_name or ""
-                date_str = dt.strftime("%Y-%m-%d") if dt else ""
-                price_str = str(price) if price is not None else ""
-                f.write(
-                    f'"{filename_str}","{store_str}","{product}",{date_str},{price_str}\n'
-                )
+    # Keep model output separate so OCR engines can be compared side by side.
+    out_csv, summary_csv = _output_csv_paths(args.ocr_engine, args.ollama_model)
+    _write_price_history_csv(out_csv, price_history, ocr_metadata_by_file)
 
     print(f"\n✅ Done. CSV written to {out_csv}")
+
+    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "summary"])
+        writer.writerows(processing_summaries)
+    print(f"[INFO] Receipt processing summaries written to {summary_csv}")
 
     # summary
     print("\n===== RECEIPT PROCESSING SUMMARY =====")
     print(f"Total images processed: {len(successes) + len(failures)}")
-    print(f"  ✅ Successes: {len(successes)}")
+    print(f"  ✅ Parsed (not accuracy-verified): {len(successes)}")
     print(f"  ❌ Failures:  {len(failures)}")
 
     if successes:

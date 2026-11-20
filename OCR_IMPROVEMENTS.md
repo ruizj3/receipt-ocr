@@ -80,6 +80,8 @@ python receipt_scanner.py
 ### Evaluate OCR Changes
 Run `python evaluate_ocr.py --limit 1` for a quick comparison, or omit `--limit` to process the receipt corpus. The existing fallback text files are previous OCR outputs, not manually verified ground truth, so edit distance reports similarity to the old output rather than true recognition accuracy. The evaluator does not overwrite those reference files.
 
+Batch processing marks receipts as parsed, not accuracy-verified. The price-history CSV records the selected OCR engine, Tesseract confidence, and review flags. Review rows flagged for low OCR confidence, prices above $100, or nonpositive prices against the receipt image; these are triage signals, not proof that a value is wrong. Use a manually checked receipt subset to measure actual item-name and price accuracy.
+
 ## Troubleshooting
 
 ### Poor OCR Results

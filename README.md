@@ -7,6 +7,28 @@ source ~/.bashrc
 source receipt_history_env/bin/activate
 python receipt_scanner.py
 
+The default command uses the existing Tesseract-first OCR pipeline. To run the
+same batch through an Ollama vision model instead, install and start Ollama,
+install its Python client, and download the model:
+
+```sh
+ollama pull qwen2.5vl:7b
+pip install ollama
+python receipt_scanner.py --ocr-engine ollama
+```
+
+Use `--ollama-model MODEL_NAME` to select another installed vision model. The
+Ollama mode sends each receipt image directly to the model for transcription;
+the prompt preserves printed lines and price columns, and the existing
+rule-based item parser still converts that text to line items. It writes
+model-specific `receipt_price_history_ollama_<model>.csv` and
+`receipt_processing_summary_ollama_<model>.csv` files so the results can be
+compared with the default Tesseract CSVs.
+Ollama mode does not silently fall back to Tesseract if the client, service, or
+model is unavailable. Its transcript is saved as a model-specific `_ollama_*.txt`
+file, leaving the existing `_fallback.txt` reference text unchanged. The
+selected engine is recorded in the output CSV.
+
 Summary - OCR Library Comparison & Current Setup
 PaddleOCR is generally considered superior to Tesseract for receipt OCR because:
 
